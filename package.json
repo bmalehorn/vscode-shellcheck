@@ -2,7 +2,7 @@
 	"name": "shellcheck",
 	"displayName": "shellcheck",
 	"description": "An extension to use shellcheck in vscode",
-	"version": "0.8.0",
+	"version": "1.0.0-alpha",
 	"publisher": "timonwong",
 	"categories": [
 		"Programming Languages",
@@ -116,11 +116,10 @@
 				"shellcheck.disableVersionCheck": {
 					"description": "Whether to diable shellcheck binary version check, which prompt for updating when outdated version found.",
 					"type": [
-						"boolean",
-						"null"
+						"boolean"
 					],
 					"scope": "application",
-					"default": null
+					"default": false
 				}
 			}
 		}

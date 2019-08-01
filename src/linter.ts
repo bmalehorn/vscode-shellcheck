@@ -1,8 +1,10 @@
 import * as path from 'path';
+import * as semver from 'semver';
 import * as vscode from 'vscode';
+import { createParser, ParseResult } from './parser';
 import { ThrottledDelayer } from './utils/async';
 import { FileMatcher, FileSettings } from './utils/filematcher';
-import { checkTool } from './utils/tool-check';
+import { getToolVersion, tryPromptForUpdatingTool } from './utils/tool-check';
 import * as wsl from './utils/wslSupport';
 
 
@@ -48,76 +50,6 @@ namespace CommandIds {
     export const openRuleDoc: string = 'shellcheck.openRuleDoc';
 }
 
-interface ShellCheckItem {
-    file: string;
-    line: number;
-    endLine?: number;
-    column: number;
-    endColumn?: number;
-    level: string;
-    code: number;
-    message: string;
-}
-
-function fixPosition(textDocument: vscode.TextDocument, pos: vscode.Position): vscode.Position {
-    // Since json format treats tabs as **8** characters, we need to offset it.
-    let charPos = pos.character;
-    const s = textDocument.getText(new vscode.Range(pos.with({ character: 0 }), pos));
-    for (const ch of s) {
-        if (ch === '\t') {
-            charPos -= 7;
-        }
-    }
-
-    return pos.with({ character: charPos });
-}
-
-function levelToDiagnosticSeverity(level: string): vscode.DiagnosticSeverity {
-    switch (level) {
-        case 'error':
-            return vscode.DiagnosticSeverity.Error;
-        case 'style':
-        /* falls through */
-        case 'info':
-            return vscode.DiagnosticSeverity.Information;
-        case 'warning':
-        /* falls through */
-        default:
-            return vscode.DiagnosticSeverity.Warning;
-    }
-}
-
-function scCodeToDiagnosticTags(code: number): vscode.DiagnosticTag[] | undefined {
-    // SC2034 - https://github.com/koalaman/shellcheck/wiki/SC2034
-    if (code === 2034) {
-        return [vscode.DiagnosticTag.Unnecessary];
-    }
-
-    return undefined;
-}
-
-function makeDiagnostic(textDocument: vscode.TextDocument, item: ShellCheckItem): vscode.Diagnostic {
-    let startPos = new vscode.Position(item.line - 1, item.column - 1);
-    const endLine = item.endLine ? item.endLine - 1 : startPos.line;
-    const endCharacter = item.endColumn ? item.endColumn - 1 : startPos.character;
-    let endPos = new vscode.Position(endLine, endCharacter);
-    if (startPos.isEqual(endPos)) {
-        startPos = fixPosition(textDocument, startPos);
-        endPos = startPos;
-    } else {
-        startPos = fixPosition(textDocument, startPos);
-        endPos = fixPosition(textDocument, endPos);
-    }
-
-    const range = new vscode.Range(startPos, endPos);
-    const severity = levelToDiagnosticSeverity(item.level);
-    const diagnostic = new vscode.Diagnostic(range, item.message, severity);
-    diagnostic.source = 'shellcheck';
-    diagnostic.code = `SC${item.code}`;
-    diagnostic.tags = scCodeToDiagnosticTags(item.code);
-    return diagnostic;
-}
-
 function substitutePath(s: string): string {
     return s.replace(/\${workspaceRoot}/g, vscode.workspace.rootPath || '');
 }
@@ -128,18 +60,22 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
     private channel: vscode.OutputChannel;
     private settings!: ShellCheckSettings;
     private executableNotFound: boolean;
+    private toolVersion: semver.SemVer | null;
     private documentListener!: vscode.Disposable;
     private delayers!: { [key: string]: ThrottledDelayer<void> };
     private readonly fileMatcher: FileMatcher;
     private readonly diagnosticCollection: vscode.DiagnosticCollection;
+    private readonly codeActionCollection: Map<string, ParseResult[]>;
 
     public static readonly providedCodeActionKinds = [vscode.CodeActionKind.QuickFix];
 
     constructor(private readonly context: vscode.ExtensionContext) {
         this.channel = vscode.window.createOutputChannel('ShellCheck');
         this.executableNotFound = false;
+        this.toolVersion = null;
         this.fileMatcher = new FileMatcher();
         this.diagnosticCollection = vscode.languages.createDiagnosticCollection();
+        this.codeActionCollection = new Map();
 
         // code actions
         context.subscriptions.push(
@@ -158,25 +94,25 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
             }),
         );
 
-        // populate this.settings
-        this.loadConfiguration();
-        checkTool(this.settings.useWSL, this.settings.executable);
-
         // event handlers
         vscode.workspace.onDidChangeConfiguration(this.loadConfiguration, this, context.subscriptions);
         vscode.workspace.onDidOpenTextDocument(this.triggerLint, this, context.subscriptions);
         vscode.workspace.onDidCloseTextDocument((textDocument) => {
-            this.diagnosticCollection.delete(textDocument.uri);
+            this.setCollection(textDocument.uri);
             delete this.delayers[textDocument.uri.toString()];
         }, null, context.subscriptions);
 
-        // Shellcheck all open shell documents
-        vscode.workspace.textDocuments.forEach(this.triggerLint, this);
+        // populate this.settings
+        this.loadConfiguration().then(() => {
+            // Shellcheck all open shell documents
+            vscode.workspace.textDocuments.forEach(this.triggerLint, this);
+        });
     }
 
     public dispose(): void {
         this.disposeDocumentListener();
         this.diagnosticCollection.clear();
+        this.codeActionCollection.clear();
         this.diagnosticCollection.dispose();
         this.channel.dispose();
     }
@@ -187,7 +123,7 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
         }
     }
 
-    private loadConfiguration(): void {
+    private async loadConfiguration() {
         const section = vscode.workspace.getConfiguration('shellcheck', null);
         const settings = <ShellCheckSettings>{
             enabled: section.get('enable', true),
@@ -207,6 +143,7 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
 
         this.disposeDocumentListener();
         this.diagnosticCollection.clear();
+        this.codeActionCollection.clear();
         if (settings.enabled) {
             if (settings.trigger === RunTrigger.onType) {
                 this.documentListener = vscode.workspace.onDidChangeTextDocument((e) => {
@@ -219,11 +156,15 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
 
         // Configuration has changed. Re-evaluate all documents
         this.executableNotFound = false;
+        this.toolVersion = await getToolVersion(this.settings.useWSL, this.settings.executable);
+        this.channel.appendLine(`[INFO] shellcheck version: ${this.toolVersion}`);
+        tryPromptForUpdatingTool(this.toolVersion);
         vscode.workspace.textDocuments.forEach(this.triggerLint, this);
     }
 
     public provideCodeActions(document: vscode.TextDocument, range: vscode.Range | vscode.Selection, context: vscode.CodeActionContext, token: vscode.CancellationToken): vscode.ProviderResult<(vscode.Command | vscode.CodeAction)[]> {
         const actions: vscode.CodeAction[] = [];
+
         for (const diagnostic of context.diagnostics) {
             if (diagnostic.source !== 'shellcheck') {
                 continue;
@@ -239,6 +180,21 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
                     arguments: [`https://www.shellcheck.net/wiki/${ruleId}`],
                 };
                 actions.push(action);
+            }
+        }
+
+        const results = this.codeActionCollection.get(document.uri.toString());
+        if (results && results.length) {
+            for (const result of results) {
+                if (!result.codeAction) {
+                    continue;
+                }
+
+                if (!result.diagnostic.range.contains(range)) {
+                    continue;
+                }
+
+                actions.push(result.codeAction);
             }
         }
 
@@ -260,7 +216,7 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
         }
 
         if (!this.settings.enabled) {
-            this.diagnosticCollection.delete(textDocument.uri);
+            this.setCollection(textDocument.uri);
             return;
         }
 
@@ -291,7 +247,8 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
             }
 
             const executable = settings.executable || 'shellcheck';
-            let args = ['-f', 'json'];
+            const parser = createParser(textDocument);
+            let args = ['-f', parser.outputFormat];
             if (settings.exclude.length) {
                 args = args.concat(['-e', settings.exclude.join(',')]);
             }
@@ -346,12 +303,12 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
                         output.push(data.toString());
                     })
                     .on('end', () => {
-                        let diagnostics: vscode.Diagnostic[] = [];
+                        let result: ParseResult[] | null = null;
                         if (output.length) {
-                            diagnostics = this.parseShellcheckResult(textDocument, output.join(''));
+                            result = parser.parse(output.join(''));
                         }
 
-                        this.diagnosticCollection.set(textDocument.uri, diagnostics);
+                        this.setCollection(textDocument.uri, result);
                         resolve();
                     });
             } else {
@@ -360,17 +317,16 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
         });
     }
 
-    private parseShellcheckResult(textDocument: vscode.TextDocument, s: string): vscode.Diagnostic[] {
-        const diagnostics: vscode.Diagnostic[] = [];
-
-        const items = <ShellCheckItem[]>JSON.parse(s);
-        for (const item of items) {
-            if (item) {
-                diagnostics.push(makeDiagnostic(textDocument, item));
-            }
+    private setCollection(uri: vscode.Uri, results?: ParseResult[] | null) {
+        if (!results || !results.length) {
+            this.diagnosticCollection.delete(uri);
+            this.codeActionCollection.delete(uri.toString());
+            return;
         }
 
-        return diagnostics;
+        const diagnostics = results.map((result) => result.diagnostic);
+        this.diagnosticCollection.set(uri, diagnostics);
+        this.codeActionCollection.set(uri.toString(), results);
     }
 
     private showShellCheckError(error: any, executable: string): void {
@@ -384,4 +340,3 @@ export default class ShellCheckProvider implements vscode.CodeActionProvider {
         vscode.window.showInformationMessage(message);
     }
 }
-
